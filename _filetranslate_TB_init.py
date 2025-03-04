@@ -4,8 +4,8 @@ import os
 import glob
 
 # Constants matching the plugin
-CSV_ESCAPE = '¶'
 CSV_SEPARATOR = '→'
+CSV_ESCAPE = '¶'
 UTF8_BOM = '\uFEFF'
 
 def escape_csv(text):
@@ -20,11 +20,11 @@ def escape_csv(text):
     return text
 
 def write_csv(filepath, rows):
-    with open(filepath, 'w', encoding="utf-8") as f:
-        f.write(UTF8_BOM)  # Add BOM
+    with open(filepath, 'wb') as f:
+        f.write(UTF8_BOM.encode('utf-8'))  # Add BOM
         for row in rows:
             escaped_row = [escape_csv(cell) for cell in row]
-            f.write(CSV_SEPARATOR.join(escaped_row) + '\n')
+            f.write((CSV_SEPARATOR.join(escaped_row) + '\n').encode('utf-8'))
 
 def read_csv(filepath):
     result = {}
@@ -96,14 +96,14 @@ def extract_text_from_ks(ks_file):
             if text_match and text_match.group(1).strip():
                 strings.append([text_match.group(1).strip(), ""])
         # Handle plain text lines (no tags at beginning of line) or some silliness like text starting with [r]
-        elif not any(line.strip().startswith(prefix) for prefix in non_translatable_prefixes) or (line.startswith("[r]") and len(line) > 3):
+        elif not any(line.strip().startswith(prefix) for prefix in non_translatable_prefixes) or (re.match(r'^\s*\[(?:l|r|ruby|emb)\b', line) and len(line) > 3):
             strings.append([line, ""])
 
         chara_match = re.search(r'\[chara_ptext\s+.*?name\s*=\s*"([^"]+)".*?\]|^#([^\n]+)', line)
         if chara_match:
             chara_name = chara_match.group(1) or chara_match.group(2)
             if chara_name not in characters:
-                characters[chara_name] = ""
+                characters[re.sub(r' ', '', chara_name)] = ""
 
         # Extract eval expressions (comment them initially)
         eval_match = re.search(r'(?:\[eval|@eval)\s+exp\s*=\s*([\"\'])([^\1]+)\1.*?\]', line)
@@ -113,7 +113,7 @@ def extract_text_from_ks(ks_file):
                 exp = "//" + exp
                 exp = re.sub(r"\s*([\+\-]*)=\s*", r'\1=', exp)
                 if exp and exp.strip() and exp not in attributes:
-                    attributes[exp] = ""
+                    attributes[re.sub(r' ', '', exp)] = ""
 
         # Extract other attributes with name=value pattern in tags
         attribute_matches = re.finditer(r'\[[^\]]+?(?:\s+(?:j?name|text|title|alt|label)\s*=\s*\"([^\"\n]+)\")(?:\s+(?:j?name|text|title|alt|label)\s*=\s*\"([^\"\n]+)\")?(?:\s+(?:j?name|text|title|alt|label)\s*=\s*\"([^\"\n]+)\")?', line)
@@ -121,7 +121,7 @@ def extract_text_from_ks(ks_file):
             attr_value = match.group(1) or match.group(2) or match.group(3)
             attr_value = "//" + attr_value.strip()
             if attr_value not in attributes:
-                attributes[attr_value] = ""
+                attributes[re.sub(r' ', '', attr_value)] = ""
 
     return strings, attributes, characters
 

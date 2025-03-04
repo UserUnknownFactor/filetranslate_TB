@@ -93,7 +93,7 @@ patchCoreMethods: function () {
         that.translateScenario(this.kag.stat.current_scenario, scenario);
         return scenario;
     };
-    
+
     function getStorageFolder(pm, bg=false) {
             const folder = pm.folder? pm.folder : `${bg ? 'bg' : 'fg'}image`;
             const storage_url = pm.storage && $.isHTTP(pm.storage) ? '' :"data/" + folder;
@@ -123,7 +123,7 @@ patchCoreMethods: function () {
             }
             return old_button_start.call(this, pm);
         };
-    
+
     // Patch tag.bg.start to translate image paths.
     const old_bg_start = tyrano.plugin.kag.tag.bg.start;
     if (old_bg_start)
@@ -136,12 +136,12 @@ patchCoreMethods: function () {
         };
 
     // Patch startTag to translate tag parameters on the fly.
-    const old_startTag = tyrano.plugin.kag.ftag.startTag;
+    /*const old_startTag = tyrano.plugin.kag.ftag.startTag;
     tyrano.plugin.kag.ftag.startTag = function (tag_name, pm) {
         if (!!that.config.enabled)
             pm = that.translateTagParams(tag_name, pm);
         return old_startTag.call(this, tag_name, pm);
-    };
+    };*/
 
     // Patch chara_ptext.start to translate characters (sidesteps binding)
     const old_chara_ptext_stat = tyrano.plugin.kag.tag.chara_ptext.start;
@@ -152,6 +152,19 @@ patchCoreMethods: function () {
                 this.kag.stat.charas[pm.name].jname = that.data.characters[pm.name];
         }
         return old_chara_ptext_stat.call(this, pm);
+    };
+
+    tyrano.plugin.kag.tag.emb = {
+        vital: ["exp"],
+        // space=Y; adds space on: 3 = both sides, 2 = left, 1 = right
+        pm: { exp: '', space: 0b1+0b10 },
+        log_join: "true",
+        start: function (pm) {
+            let val = '' + this.kag.embScript(pm.exp);
+            if (pm.space)
+                val = `${(pm.space & 0b10 ? ' ' : '')}${val}${(pm.space & 0b1 ? ' ' : '')}`;
+            this.kag.ftag.startTag("text", { val: val, backlog: "join", });
+        }
     };
 },
 
@@ -373,21 +386,58 @@ tryLoadTranslations: function (scenario) {
 },
 
 tagREGE: /\[([a-z0-9_\-]+)(\s+[^\]]*?)?\]/gi,
+findTranslationMatch: function(originalTextNormalized, translations, pointer) {
+    const maxDistance = 15;
 
-translateScenario: function (scenario, scenario_obj) {
-    const array_s = scenario_obj.array_s;
-    if (!scenario) return array_s;
+    // Check current pointer first
+    if (pointer < translations.length) {
+        const expectedOriginalNormalized = this.normalizeString(translations[pointer][0]);
+        if (originalTextNormalized === expectedOriginalNormalized)
+            return { found: true, index: pointer };
+    }
 
-    this.tryLoadTranslations(scenario);
+    // Forward search
+    for (let forward = 1; forward <= maxDistance && pointer + forward < translations.length; forward++) {
+        const expectedOriginalNormalized = this.normalizeString(translations[pointer + forward][0]);
+        if (originalTextNormalized === expectedOriginalNormalized)
+            return { found: true, index: pointer + forward };
+    }
 
-    const translations = this.data.strings[scenario];
-    const attributes = this.data.attributes[scenario];
-    if (!translations.length && !attributes.length) return array_s;
+    // Partial search (like strings broken by ruby tags)
+    for (let idx = 0; idx < translations.length; idx++) {
+        const originalFullText = translations[idx][0];
+        if (originalFullText.indexOf('[') === -1) continue;
 
-    if (!this.data.translationPointers[scenario]) this.data.translationPointers[scenario] = 0;
-    if (!this.data.missingStrings[scenario]) this.data.missingStrings[scenario] = new Set();
+        const parsedOriginal = tyrano.plugin.kag.parser.old_parseScenario(originalFullText).array_s;
+        for (let j = 0; j < parsedOriginal.length; j++) {
+            if (parsedOriginal[j].name === "text") {
+                const textSegment = this.normalizeString(parsedOriginal[j].pm.val);
+                if (textSegment === originalTextNormalized)
+                    return { found: true, index: idx };
+            }
+        }
+    }
 
-    // Create a set for quick checking if a string has any translation
+    // Backward search
+    for (let backward = 1; backward <= maxDistance && pointer - backward >= 0; backward++) {
+        const expectedOriginalNormalized = this.normalizeString(translations[pointer - backward][0]);
+        if (originalTextNormalized === expectedOriginalNormalized)
+            return { found: true, index: pointer - backward };
+    }
+
+    // Full file search (excluding already searched range)
+    for (let idx = 0; idx < translations.length; idx++) {
+        if (idx >= pointer - maxDistance && idx <= pointer + maxDistance) continue;
+
+        const expectedOriginalNormalized = this.normalizeString(translations[idx][0]);
+        if (originalTextNormalized === expectedOriginalNormalized)
+            return { found: true, index: idx };
+    }
+
+    return { found: false, index: -1 };
+},
+
+generateOriginalStringsSet: function(translations) {
     const originalStringsSet = new Set();
     for (let i = 0; i < translations.length; i++) {
         const translationPair = translations[i];
@@ -407,10 +457,30 @@ translateScenario: function (scenario, scenario_obj) {
             }
         }
     }
+    return originalStringsSet;
+},
 
+translateScenario: function (scenario, scenario_obj) {
+    const array_s = scenario_obj.array_s;
+    if (!scenario) return array_s;
+
+    this.tryLoadTranslations(scenario);
+
+    const translations = this.data.strings[scenario];
+    const attributes = this.data.attributes[scenario];
+    if (!translations.length && !Object.keys(attributes).length) return array_s;
+
+    if (!this.data.translationPointers[scenario]) this.data.translationPointers[scenario] = 0;
+    if (!this.data.missingStrings[scenario]) this.data.missingStrings[scenario] = new Set();
+
+    const originalStringsSet = this.generateOriginalStringsSet(translations);
     let is_script = false;
     let pointer = this.data.translationPointers[scenario];
     const missingSet = this.data.missingStrings[scenario];
+    const maxDistance = 15;
+
+    // Track offset changes
+    const offsetChanges = [];
 
     // Process text nodes
     for (let i = 0; i < array_s.length; i++) {
@@ -427,95 +497,20 @@ translateScenario: function (scenario, scenario_obj) {
 
                     // Quick check if we have any translation for this text
                     if (!originalStringsSet.has(originalTextNormalized)) {
-                        if (!missingSet.has(originalTextNormalized)) {
-                            missingSet.add(originalTextNormalized);
-                            //this.log(`Missing translation for text: "${originalTextNormalized}" in scenario ${scenario}`);
-                        }
+                        if (!missingSet.has(originalTextNormalized)) missingSet.add(originalTextNormalized);
                         continue;
                     }
 
-                    let matchFound = false;
-                    const maxDistance = 15;
-
-                    // Try current pointer first the pointer thing is important since sequence of text must match and we cant use dict here
-                    if (pointer < translations.length) {
-                        const expectedOriginalNormalized = this.normalizeString(translations[pointer][0]);
-                        if (originalTextNormalized === expectedOriginalNormalized) {
-                            matchFound = true;
-                            // Use TyranoBuilder's parseScenario to handle the translation
-                            const newIndex = this.applyTranslationWithParser(array_s, i, translations[pointer], scenario_obj.map_label);
-                            i = newIndex; // Skip ahead to the new index
-                            pointer++;
-                            this.data.translationPointers[scenario] = pointer;
-                        }
-                    }
-
-                    // Search forward
-                    if (!matchFound) {
-                        for (let forward = 1; forward <= maxDistance && pointer + forward < translations.length; forward++) {
-                            const expectedOriginalNormalized = this.normalizeString(translations[pointer + forward][0]);
-                            if (originalTextNormalized === expectedOriginalNormalized) {
-                                matchFound = true;
-                                const newIndex = this.applyTranslationWithParser(array_s, i, translations[pointer + forward], scenario_obj.map_label);
-                                i = newIndex;
-                                pointer = pointer + forward + 1;
-                                this.data.translationPointers[scenario] = pointer;
-                                break;
-                            }
-                        }
-                    }
-
-                    // Search partial from the original at the pointer
-                    if (!matchFound) {
-                        for (let idx = 0; idx < translations.length; idx++) {
-                            const originalFullText = translations[idx][0];
-                            if (originalFullText.indexOf('[') === -1) continue;
-                            const parsedOriginal = tyrano.plugin.kag.parser.old_parseScenario(originalFullText).array_s;
-                            for (let j = 0; j < parsedOriginal.length; j++) {
-                                if (parsedOriginal[j].name === "text") {
-                                    const textSegment = this.normalizeString(parsedOriginal[j].pm.val);
-                                    if (textSegment === originalTextNormalized) {
-                                        matchFound = true;
-                                        const newIndex = this.applyTranslationWithParser(array_s, i, translations[idx], scenario_obj.map_label);
-                                        i = newIndex;
-                                        pointer = idx + 1;
-                                        this.data.translationPointers[scenario] = pointer;
-                                        break;
-                                    }
-                                }
-                            }
-                            if (matchFound) break;
-                        }
-                    }
-
-                    // Search backward
-                    if (!matchFound) {
-                        for (let backward = 1; backward <= maxDistance && pointer - backward >= 0; backward++) {
-                            const expectedOriginalNormalized = this.normalizeString(translations[pointer - backward][0]);
-                            if (originalTextNormalized === expectedOriginalNormalized) {
-                                matchFound = true;
-                                const newIndex = this.applyTranslationWithParser(array_s, i, translations[pointer - backward], scenario_obj.map_label);
-                                i = newIndex;
-                                break;
-                            }
-                        }
-                    }
-
-                    // Full file search as last resort
-                    if (!matchFound) {
-                        for (let idx = 0; idx < translations.length; idx++) {
-                            if (idx >= pointer - maxDistance && idx <= pointer + maxDistance) {
-                                continue; // Skip already searched range
-                            }
-
-                            const expectedOriginalNormalized = this.normalizeString(translations[idx][0]);
-                            if (originalTextNormalized === expectedOriginalNormalized) {
-                                matchFound = true;
-                                const newIndex = this.applyTranslationWithParser(array_s, i, translations[idx], scenario_obj.map_label);
-                                i = newIndex;
-                                break;
-                            }
-                        }
+                    const searchResult = this.findTranslationMatch(originalTextNormalized, translations, pointer, maxDistance);
+                    if (searchResult.found) {
+                        const [newIndex, countDiff] = this.applyTranslationWithParser(array_s, i, translations[searchResult.index]);
+                        if (countDiff !== 0)
+                            offsetChanges.push({ index: i, difference: countDiff });
+                        i = newIndex;
+                        pointer = searchResult.index + 1;
+                        this.data.translationPointers[scenario] = pointer;
+                    } else {
+                        if (!missingSet.has(originalTextNormalized)) missingSet.add(originalTextNormalized);
                     }
                 } else {
                     const textNormalized = this.normalizeString(tobj.pm.val);
@@ -543,62 +538,130 @@ translateScenario: function (scenario, scenario_obj) {
                     tobj.pm.exp = attributes[script];
                 }
             }
-        } else {
-            if (tobj.pm) {
-                for (let key in tobj.pm) {
-                    if (attributes[tobj.pm[key]]) {
-                        tobj.pm[key] = attributes[tobj.pm[key]];
-                    }
-                }
-            }
+        } else if (tobj.pm) {
+            for (let key in tobj.pm)
+                if (attributes[tobj.pm[key]])
+                    tobj.pm[key] = attributes[tobj.pm[key]];
         }
     }
+
+    // Apply all label offset changes at once
+    if (offsetChanges.length > 0)
+        //this.resetLabelIndexes(array_s, scenario_obj.map_label);
+        this.fixLabelOffsets(scenario_obj.map_label, offsetChanges);
 
     return array_s;
 },
 
-fixLabelOffsets: function(array_s, map_label, insertIndex, countDifference) { 
-  if (countDifference === 0) return;
+/*
+resetLabelIndexes: function(array_s, map_label) {
+    if (!array_s || !array_s.length || !map_label) return;
 
-  for (let labelName in map_label) {
-    const labelInfo = map_label[labelName];
-    if (labelInfo.index > insertIndex) labelInfo.index += countDifference;
-  }
-  
-  // Also update any explicit references to line numbers or indices in the array
-  for (let i = insertIndex; i < array_s.length; i++) {
-    const obj = array_s[i];
+    // Scan array_s once to find all label instructions
+    for (let i = 0; i < array_s.length; i++) {
+        const cmd = array_s[i];
 
-    if (obj.name === "jump" || obj.name === "link" || obj.name === "button")
-      if (obj.pm && obj.pm.target_index && obj.pm.target_index > insertIndex)
-        obj.pm.target_index += countDifference;
+        // Check if this is a label command
+        if (cmd && cmd.name === "label" && cmd.pm && cmd.pm.label_name) {
+            const labelName = cmd.pm.label_name;
 
-    if (obj.pm && typeof obj.pm.index === 'number' && obj.pm.index > insertIndex)
-      obj.pm.index += countDifference;
-  }
+            if (map_label[labelName]) map_label[labelName].index = i;
+            else map_label[labelName] = { 
+                line:0, index:i, label_name: labelName, val:cmd.pm.val 
+            };
+        }
+    }
+},*/
+
+
+fixLabelOffsets: function(map_label, offsetChanges) {
+    if (!map_label || !offsetChanges.length) return;
+
+    // Sort changes by index
+    offsetChanges.sort((a, b) => a.index - b.index);
+
+    // Create array of cumulative offsets
+    const positions = [];
+    const cumOffsets = [];
+    let total = 0;
+
+    for (const change of offsetChanges) {
+        total += change.difference;
+        positions.push(change.index);
+        cumOffsets.push(total);
+    }
+
+    // Update each label with binary search
+    for (let labelName in map_label) {
+        const labelInfo = map_label[labelName];
+        if (!labelInfo || typeof labelInfo.index !== 'number') continue;
+
+        // Binary search to find largest position <= label index
+        const pos = labelInfo.index;
+        let low = 0, high = positions.length - 1;
+        let offset = 0;
+
+        while (low <= high) {
+            const mid = Math.floor((low + high) / 2);
+            if (positions[mid] <= pos) {
+                offset = cumOffsets[mid];
+                low = mid + 1;
+            } else {
+                high = mid - 1;
+            }
+        }
+
+        if (offset !== 0)
+            labelInfo.index += offset;
+    }
 },
 
-// Use TyranoBuilder's parser to handle the translation
-applyTranslationWithParser: function (array_s, index, translationPair, map_label) {
+/*
+fixLabelOffsets1: function(map_label, offsetChanges) {
+    if (!map_label || !offsetChanges.length) return;
+
+    // Sort changes by index to process them in order
+    offsetChanges.sort((a, b) => a.index - b.index);
+
+    for (let labelName in map_label) {
+        const labelInfo = map_label[labelName];
+        if (!labelInfo || typeof labelInfo.index !== 'number') continue;
+
+        let totalOffset = 0;
+        for (const change of offsetChanges)
+            if (labelInfo.index >= change.index) totalOffset += change.difference;
+
+        if (totalOffset !== 0) labelInfo.index += totalOffset;
+    }
+},*/
+
+applyTranslationWithParser: function (array_s, index, translationPair) {
     const originalText = translationPair[0];
-    // NOTE: can't have `*` first since it's a label marker
     let translatedText = translationPair[1].replace(/^\s*\*/, "\\*");
 
-    // Parse both original and translated text
     const parsed_array_old = tyrano.plugin.kag.parser.old_parseScenario(originalText).array_s || [];
     const parsed_array_new = tyrano.plugin.kag.parser.old_parseScenario(translatedText).array_s || [];
 
-    // Modify and reparse the translated text
+    // Try to minimize costly splices, compare element sequences
+    let sameSequence = parsed_array_old.length === parsed_array_new.length;
+
+    // Process word wrapping for new text elements
     for (let i = 0; i < parsed_array_new.length; i++) {
+        if (sameSequence && parsed_array_old[i].name !== parsed_array_new[i].name) 
+            sameSequence = false;
+
         if (parsed_array_new[i].name === "text") {
             const wrappedText = this.applyWordWrapping(parsed_array_new[i].pm.val);
             const reparsed = tyrano.plugin.kag.parser.old_parseScenario(wrappedText).array_s || [];
-            for (const reparsedElement of reparsed) {
-                if (reparsedElement.name === "text") {
-                    reparsedElement.pm.val = reparsedElement.pm.val.replace(/^\\\*/, '*');
-                    reparsedElement.val = reparsedElement.val.replace(/^\\\*/, '*');
+            if (reparsed.length > 1) 
+                sameSequence = false;
+
+            reparsed.forEach(element => {
+                if (element.name === "text") {
+                    element.pm.val = element.pm.val.replace(/^\\\*/, '*');
+                    element.val = element.val.replace(/^\\\*/, '*');
                 }
-            }
+            });
             // Replace the current element with the reparsed elements
             parsed_array_new.splice(i, 1, ...reparsed);
 
@@ -607,18 +670,28 @@ applyTranslationWithParser: function (array_s, index, translationPair, map_label
         }
     }
 
-    // Calculate the difference in element count
-    const oldCount = Math.max(1, parsed_array_old.length);
-    const newCount = parsed_array_new.length;
-    
-    // Replace the old elements with the new ones
-    array_s.splice(index, oldCount, ...parsed_array_new);
-    
-    // Fix label offsets if the number of elements changed
-    this.fixLabelOffsets(array_s, map_label, index, newCount - oldCount);
-    
-    // Return the new index (after all inserted elements)
-    return index + newCount - 1;
+    // Adjust index to point to actual text start of the translated content
+    let oldTextStart = parsed_array_old.findIndex(obj => obj.name === "text");
+    oldTextStart = oldTextStart === -1 ? 0 : oldTextStart;
+    const actualIndex = index - oldTextStart;
+
+    if (sameSequence) {
+        // Just update text content where needed
+        parsed_array_new.forEach((newObj, i) => {
+            if (newObj.name === "text") {
+                array_s[actualIndex + i].pm.val = newObj.pm.val;
+                array_s[actualIndex + i].val = newObj.val;
+            }
+        });
+        return [actualIndex + parsed_array_new.length - 1, 0];
+    }
+
+    // Different sequence - need to splice
+    const elementsToRemove = parsed_array_old.length || 1;
+    const countDifference = parsed_array_new.length - elementsToRemove;
+    array_s.splice(actualIndex, elementsToRemove, ...parsed_array_new);
+
+    return [actualIndex + parsed_array_new.length - 1, countDifference];
 },
 
 sharedContext:document.createElement("canvas").getContext("2d"),
@@ -729,7 +802,7 @@ translateTagParams: function (tag_name, params) {
 
     const translations = this.data.strings[scenario];
     const attributes = this.data.attributes[scenario];
-    if (!translations.length && !attributes.length) return params;
+    if (!translations.length && !Object.keys(attributes).length) return params;
 
     if (tag_name === "text" || tag_name === "label" || tag_name === "button") 
         if (params.text && attributes[params.text]) params.text = attributes[params.text];
@@ -805,10 +878,10 @@ start: function (pm) {
     const translator = tyrano.plugin.kag.translator;
     let saved = false;
     let last_error = '';
-    
+
     translator.log(`Switching language to: ${pm.lang}`);
     translator.switchLanguage(pm.lang);
-    
+
     // Save the language preference if storage is available
     try {
         if (window.localStorage) {
@@ -822,7 +895,7 @@ start: function (pm) {
         last_error = e.toString();
     }
     if (!saved) translator.log("Could not save language preference: \n" + last_error);
-    
+
     that.kag.ftag.nextOrder();
 }
 }; // end tyrano.plugin.kag.tag.switch_language
